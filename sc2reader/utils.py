@@ -381,12 +381,10 @@ class PersonDict(dict):
         self._key_map = dict()
         
         if args:
-            print args
             for arg in args[0]:
                 self[arg[0]] = arg[1]
                 
         if kwargs:
-            print kwargs
             for key, value in kwargs.iteritems():
                 self[key] = value
         
