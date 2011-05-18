@@ -2,6 +2,7 @@ from itertools import chain
 
 from sc2reader.objects import *
 from sc2reader.utils import BIG_ENDIAN,LITTLE_ENDIAN
+from collections import defaultdict
 
 class SetupParser(object):
     def parse_join_event(self, buffer, frames, type, code, pid):
@@ -9,20 +10,82 @@ class SetupParser(object):
         
     def parse_start_event(self, buffer, frames, type, code, pid):
         return GameStartEvent(frames, pid, type, code)
-        
+
 class ActionParser(object):
     def parse_leave_event(self, buffer, frames, type, code, pid):
         return PlayerLeaveEvent(frames, pid, type, code)
-    
+
     def parse_ability_event(self, buffer, frames, type, code, pid):
-        """ Unit ability"""
+        buffer.skip(7)
+        switch = buffer.read_byte()
+        if switch in (0x30,0x50):
+            buffer.read_byte()
+        buffer.skip(24)
+        return AbilityEvent(frames, pid, type, code, None)
+
+    def parse_selection_event(self, buffer, frames, type, code, pid):
+        bank = code >> 4
+        selFlags = buffer.read_byte()
+        dsuCount = buffer.read_byte()
+        buffer.read(bits=dsuCount)
+
+        # <count> (<type_id>, <count>,)*
+        object_types = [ (buffer.read_object_type(read_modifier=True), buffer.read_byte(), ) for i in range(buffer.read_byte()) ]
+        # <count> (<object_id>,)*
+        object_ids = [ buffer.read_object_id() for i in range(buffer.read_byte()) ]
+
+        # repeat types count times
+        object_types = chain(*[[object_type,]*count for (object_type, count) in object_types])
+        objects = zip(object_ids, object_types)
+
+        return AbilityEvent(frames, pid, type, code, None)
+
+    def parse_hotkey_event(self, buffer, frames, type, code, pid):
+        hotkey = code >> 4
+        action, mode = buffer.shift(2), buffer.shift(2)
+
+        if mode == 1: # deselect overlay mask
+            mask = buffer.read_bitmask()
+            overlay = lambda a: Selection.mask(a, mask)
+        elif mode == 2: # deselect mask
+            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
+            overlay = lambda a: Selection.deselect(a, indexes)
+        elif mode == 3: # replace mask
+            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
+            overlay = lambda a: Selection.replace(a, indexes)
+        else:
+            overlay = None
+
+        if action == 0:
+            return SetToHotkeyEvent(frames, pid, type, code, hotkey, overlay)
+        elif action == 1:
+            return AddToHotkeyEvent(frames, pid, type, code, hotkey, overlay)
+        elif action == 2:
+            return GetHotkeyEvent(frames, pid, type, code, hotkey, overlay)
+
+    def parse_transfer_event(self, buffer, frames, type, code, pid):
+        def read_resource(buffer):
+            block = buffer.read_int(BIG_ENDIAN)
+            base, multiplier, extension = block >> 8, block & 0xF0, block & 0x0F
+            return base*multiplier+extension
+
+        target = code >> 4
+        buffer.skip(1) #Always 84
+        minerals,vespene = read_resource(buffer), read_resource(buffer)
+        buffer.skip(8)
+
+        return ResourceTransferEvent(frames, pid, type, code, target, minerals, vespene)
+
+class ActionParser_16561(ActionParser):
+    def parse_ability_event(self, buffer, frames, type, code, pid):
         flag = buffer.read_byte()
         atype = buffer.read_byte()
         
-        ability = None
         if atype & 0x20: # command card
+            end = buffer.peek(35)
             ability = buffer.read_byte() << 8 | buffer.read_byte() 
-            if flag in (0x29, 0x19): # cancels
+            
+            if flag in (0x29, 0x19, 0x14): # cancels
                 # creation autoid number / object id
                 ability = ability << 8 | buffer.read_byte()
                 created_id = buffer.read_object_id() 
@@ -32,7 +95,7 @@ class ActionParser(object):
             else:
                 ability_flags = buffer.shift(6)
                 ability = ability << 8 | ability_flags
-              
+                
                 if ability_flags & 0x10:
                     # ability(3), coordinates (4), ?? (4)
                     location = buffer.read_coordinate()
@@ -45,18 +108,33 @@ class ActionParser(object):
                     obj_id = buffer.read_object_id()
                     obj_type = buffer.read_object_type()
                     target = (obj_id, obj_type,)
-                    buffer.skip(10)
+                    switch = buffer.read_byte()
+                    buffer.read_hex(9)
                     return TargetAbilityEvent(frames, pid, type, code, ability, target)
-                    
-                elif ability_flags & 0x30 == 0x00:
-                    return AbilityEvent(frames, pid, type, code, ability)
-
+                
+                else:
+                    return AbilityEvent(frames,pid,type,code,None)
+                
         elif atype & 0x40: # location/move
-            # coordinates (4), ?? (6)
-            location = buffer.read_coordinate()
-            buffer.skip(5)
-            return LocationAbilityEvent(frames, pid, type, code, ability, location)
+            if flag == 0x08:
+                # coordinates (4), ?? (6)
+                location = buffer.read_coordinate()
+                buffer.skip(5)
+                return LocationAbilityEvent(frames, pid, type, code, None, location)
             
+            elif flag in (0x04,0x07):
+                print "Made it!"
+                h = buffer.read_hex(2)
+                hinge = buffer.read_byte()
+                if hinge & 0x20:
+                    "\t%s - %s" % (hex(hinge),buffer.read_hex(9))
+                elif hinge & 0x40:
+                    "\t%s - %s" % (hex(hinge),buffer.read_hex(18))
+                elif hinge < 0x10:
+                    pass
+                    
+                return UnknownLocationAbilityEvent(frames, pid, type, code, None)
+
         elif atype & 0x80: # right-click on target?
             # ability (2), object id (4), object type (2), ?? (10)
             ability = buffer.read_byte() << 8 | buffer.read_byte() 
@@ -65,6 +143,23 @@ class ActionParser(object):
             target = (obj_id, obj_type,)
             buffer.skip(10)
             return TargetAbilityEvent(frames, pid, type, code, ability, target)
+            
+        elif atype in (0x08,0x0a): #new to patch 1.3.3
+            #10 bytes total, coordinates have a different format?
+            #X coordinate definitely is the first byte, with (hopefully) y next
+            print hex(flag)
+            event = UnknownAbilityEvent(frames, pid, type, code, None)
+            event.location1 = buffer.read_coordinate()
+            buffer.skip(5)
+            return event
+
+        else:
+            print hex(atype)
+            print hex(buffer.cursor)
+            raise TypeError()
+        
+        print "%s - %s" % (hex(atype),hex(flag))
+        raise TypeError("Shouldn't be here EVER!")
         
     def parse_selection_event(self, buffer, frames, type, code, pid):
         bank = code >> 4
@@ -93,43 +188,82 @@ class ActionParser(object):
         objects = zip(object_ids, object_types)
 
         return SelectionEvent(frames, pid, type, code, bank, objects, deselect)
+
+class ActionParser_18574(ActionParser_16561):
+    def parse_ability_event(self, buffer, frames, type, code, pid):
+        flag = buffer.read_byte()
+        atype = buffer.read_byte()
         
-    def parse_hotkey_event(self, buffer, frames, type, code, pid):
-        hotkey = code >> 4
-        action, mode = buffer.shift(2), buffer.shift(2)
-        
-        if mode == 1: # deselect overlay mask
-            mask = buffer.read_bitmask()
-            overlay = lambda a: Selection.mask(a, mask)
-        elif mode == 2: # deselect mask
-            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
-            overlay = lambda a: Selection.deselect(a, indexes)
-        elif mode == 3: # replace mask
-            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
-            overlay = lambda a: Selection.replace(a, indexes)
+        if atype & 0x20: # command card
+            end = buffer.peek(35)
+            ability = buffer.read_byte() << 8 | buffer.read_byte()
+
+            if flag in (0x29, 0x19, 0x14): # cancels
+                # creation autoid number / object id
+                ability = ability << 8 | buffer.read_byte()
+                created_id = buffer.read_object_id()
+                # TODO : expose the id
+                return AbilityEvent(frames, pid, type, code, ability)
+
+            else:
+                ability_flags = buffer.shift(6)
+                ability = ability << 8 | ability_flags
+
+                if ability_flags & 0x10:
+                    # ability(3), coordinates (4), ?? (4)
+                    location = buffer.read_coordinate()
+                    buffer.skip(4)
+                    return LocationAbilityEvent(frames, pid, type, code, ability, location)
+
+                elif ability_flags & 0x20:
+                    # ability(3), object id (4),  object type (2), ?? (10)
+                    code = buffer.read_short() # code??
+                    obj_id = buffer.read_object_id()
+                    obj_type = buffer.read_object_type()
+                    target = (obj_id, obj_type,)
+                    switch = buffer.read_byte()
+                    buffer.read_hex(9)
+                    return TargetAbilityEvent(frames, pid, type, code, ability, target)
+
+                else:
+                    return AbilityEvent(frames,pid,type,code,None)
+
+        elif atype & 0x40: # location/move ??
+            h = buffer.read_hex(2)
+            hinge = buffer.read_byte()
+            if hinge & 0x20:
+                "\t%s - %s" % (hex(hinge),buffer.read_hex(9))
+            elif hinge & 0x40:
+                "\t%s - %s" % (hex(hinge),buffer.read_hex(18))
+            elif hinge < 0x10:
+                pass
+
+            return UnknownLocationAbilityEvent(frames, pid, type, code, None)
+
+        elif atype & 0x80: # right-click on target?
+            # ability (2), object id (4), object type (2), ?? (10)
+            ability = buffer.read_byte() << 8 | buffer.read_byte()
+            obj_id = buffer.read_object_id()
+            obj_type = buffer.read_object_type()
+            target = (obj_id, obj_type,)
+            buffer.skip(10)
+            return TargetAbilityEvent(frames, pid, type, code, ability, target)
+
+        elif atype < 0x10: #new to patch 1.3.3, location now??
+            #10 bytes total, coordinates have a different format?
+            #X coordinate definitely is the first byte, with (hopefully) y next
+            location = buffer.read_coordinate()
+            buffer.skip(5)
+            return LocationAbilityEvent(frames, pid, type, code, None, location)
+
         else:
-            overlay = None
-            
-        if action == 0:
-            return SetToHotkeyEvent(frames, pid, type, code, hotkey, overlay)
-        elif action == 1:
-            return AddToHotkeyEvent(frames, pid, type, code, hotkey, overlay)
-        elif action == 2:
-            return GetHotkeyEvent(frames, pid, type, code, hotkey, overlay)
-            
-    def parse_transfer_event(self, buffer, frames, type, code, pid):
-        def read_resource(buffer):
-            block = buffer.read_int(BIG_ENDIAN)
-            base, multiplier, extension = block >> 8, block & 0xF0, block & 0x0F
-            return base*multiplier+extension
-            
-        target = code >> 4
-        buffer.skip(1)   #84
-        minerals,vespene = read_resource(buffer), read_resource(buffer)
-        buffer.skip(8)
-        
-        return ResourceTransferEvent(frames, pid, type, code, target, minerals, vespene)
-        
+            print hex(atype)
+            print hex(buffer.cursor)
+            raise TypeError()
+
+        print "%s - %s" % (hex(atype),hex(flag))
+        raise TypeError("Shouldn't be here EVER!")
+
 class Unknown2Parser(object):
     def parse_0206_event(self, buffer, frames, type, code, pid):
         buffer.skip(8)
