@@ -79,7 +79,9 @@ class ReaderMap(object):
                 'replay.game.events': GameEventsReader_16561(),
             }
 
-        elif int(key) in (18574,):
+        #This one is also a catch all. If the build isn't recognized, try to use
+        #the latest parsing code and hope that it works!
+        elif int(key) in (18574,) or True:
             return {
                 'replay.initData': InitDataReader(),
                 'replay.details': DetailsReader(),
@@ -87,11 +89,9 @@ class ReaderMap(object):
                 'replay.message.events': MessageEventsReader(),
                 'replay.game.events': GameEventsReader_18574(),
             }
-        else:
-            raise KeyError(key)
 
 READERS = ReaderMap()
-    
+
 def read_header(file):
     buffer = ReplayBuffer(file)
     
@@ -112,7 +112,7 @@ def read_header(file):
     return data[1],data[3]
 
 class SC2Reader(object):
-    def __init__(self, parse="FULL", directory="", processors=[], debug=False, files=None):
+    def __init__(self, parse="FULL", directory="", processors=[], debug=False, files=None, verbose=False):
         #Sanitize the parse level
         parse = parse.upper()
         if parse not in ("FULL","PARTIAL","CUSTOM"):
@@ -128,7 +128,9 @@ class SC2Reader(object):
         if self.directory:
             location = os.path.join(self.directory,location)
         if not os.path.exists(location):
-            raise ValueError("Location must exist")
+            raise ValueError("Path `%s` cannot be found" % location)
+        
+        if self.verbose: print "Reading: %s" % location
         
         #If its a directory, read each subfile/directory and combine the lists
         if os.path.isdir(location):
@@ -157,7 +159,7 @@ class SC2Reader(object):
                     replay = process(replay)
                 
                 return replay
-                
+
     def configure(self,**options):
         self.__dict__.update(options)
         
@@ -166,7 +168,10 @@ class SC2Reader(object):
 __defaultSC2Reader = SC2Reader()
 
 def configure(**options):
-    __defaultSC2Reader.configure(options)
+    __defaultSC2Reader.configure(**options)
 
-def read(location):
-    return __defaultSC2Reader.read(location)
+def read(location, **options):
+    if options:
+        return SC2Reader(**options).read(location)
+    else:
+        return __defaultSC2Reader.read(location)

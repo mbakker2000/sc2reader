@@ -42,17 +42,11 @@ class ActionParser(object):
 
     def parse_hotkey_event(self, buffer, frames, type, code, pid):
         hotkey = code >> 4
-        action, mode = buffer.shift(2), buffer.shift(2)
+        action, read = buffer.shift(2), buffer.shift(1)
 
-        if mode == 1: # deselect overlay mask
-            mask = buffer.read_bitmask()
+        if read:
+            mask = buffer.read(bits=buffer.read_byte())
             overlay = lambda a: Selection.mask(a, mask)
-        elif mode == 2: # deselect mask
-            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
-            overlay = lambda a: Selection.deselect(a, indexes)
-        elif mode == 3: # replace mask
-            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
-            overlay = lambda a: Selection.replace(a, indexes)
         else:
             overlay = None
 
@@ -189,6 +183,29 @@ class ActionParser_16561(ActionParser):
 
         return SelectionEvent(frames, pid, type, code, bank, objects, deselect)
 
+    def parse_hotkey_event(self, buffer, frames, type, code, pid):
+        hotkey = code >> 4
+        action, mode = buffer.shift(2), buffer.shift(2)
+
+        if mode == 1: # deselect overlay mask
+            mask = buffer.read_bitmask()
+            overlay = lambda a: Selection.mask(a, mask)
+        elif mode == 2: # deselect mask
+            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
+            overlay = lambda a: Selection.deselect(a, indexes)
+        elif mode == 3: # replace mask
+            indexes = [buffer.read_byte() for i in range(buffer.read_byte())]
+            overlay = lambda a: Selection.replace(a, indexes)
+        else:
+            overlay = None
+
+        if action == 0:
+            return SetToHotkeyEvent(frames, pid, type, code, hotkey, overlay)
+        elif action == 1:
+            return AddToHotkeyEvent(frames, pid, type, code, hotkey, overlay)
+        elif action == 2:
+            return GetHotkeyEvent(frames, pid, type, code, hotkey, overlay)
+            
 class ActionParser_18574(ActionParser_16561):
     def parse_ability_event(self, buffer, frames, type, code, pid):
         flag = buffer.read_byte()
@@ -198,7 +215,7 @@ class ActionParser_18574(ActionParser_16561):
             end = buffer.peek(35)
             ability = buffer.read_byte() << 8 | buffer.read_byte()
 
-            if flag in (0x29, 0x19, 0x14): # cancels
+            if flag in (0x29, 0x19, 0x14, 0x0c): # cancels
                 # creation autoid number / object id
                 ability = ability << 8 | buffer.read_byte()
                 created_id = buffer.read_object_id()
@@ -283,9 +300,10 @@ class CameraParser(object):
         return CameraMovementEvent(frames, pid, type, code)
 
     def parse_camera08_event(self, buffer, frames, type, code, pid):
-        buffer.skip( (buffer.read_short(BIG_ENDIAN) & 0x0F) << 3 )
+        flags, extra = buffer.read_byte(), buffer.read_byte()
+        buffer.skip( (flags&0x0F) << 3 )
         return CameraMovementEvent(frames, pid, type, code)
-        
+
     def parse_camera18_event(self, buffer, frames, type, code, pid):
         buffer.skip(162)
         return CameraMovementEvent(frames, pid, type, code)
@@ -325,6 +343,10 @@ class Unknown4Parser(object):
         
     def parse_04X2_event(self, buffer, frames, type, code, pid):
         buffer.skip(2)
+        return UnknownEvent(frames, pid, type, code)
+        
+    def parse_0488_event(self, buffer, frames, type, code, pid):
+        buffer.skip(4) #Always 00 00 00 01 ?? or 00 00 00 03
         return UnknownEvent(frames, pid, type, code)
         
     def parse_04XC_event(self, buffer, frames, type, code, pid):
