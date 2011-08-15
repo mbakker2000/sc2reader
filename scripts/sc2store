@@ -1,0 +1,210 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os, sys, shutil, sqlite3
+import cPickle, time
+
+# Hack for the dev environment
+install_dir = os.path.abspath(os.path.join(os.path.dirname(__file__),'..'))
+sys.path.append(install_dir)
+import sc2reader
+
+from pprint import PrettyPrinter
+pprint = PrettyPrinter(indent=2).pprint
+
+from sqlalchemy import create_engine
+from sqlalchemy import Column, ForeignKey, distinct, Table
+from sqlalchemy import Integer, String, Sequence, DateTime
+from sqlalchemy.orm import relationship, sessionmaker
+
+from sqlalchemy.orm.exc import NoResultFound
+
+storage = 'sqlite:///:memory:'
+engine = create_engine(storage, echo=True)
+Session = sessionmaker(bind=engine)
+session = Session()
+
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.ext.associationproxy import association_proxy
+Base = declarative_base()
+
+party_members = Table('party_members', Base.metadata,
+    Column('person_id', Integer, ForeignKey('people.id')),
+    Column('party_id', Integer, ForeignKey('parties.id')),
+)
+
+class Person(Base):
+    __tablename__ = 'people'
+    id = Column(Integer, Sequence('person_id_seq'), primary_key=True)
+
+    name = Column(String(50))
+
+    parties = relationship('Party', secondary=party_members)
+    players = relationship('Player')
+
+
+class Party(Base):
+    __tablename__ = 'parties'
+    id = Column(Integer, Sequence('parties_id_seq'), primary_key=True)
+
+    player_names = Column(String(255))
+
+    members = relationship('Person', secondary=party_members)
+    teams = relationship('Team')
+
+    def __init__(self, *players):
+        self.player_names = ''
+        self.members = list()
+        self.add_players(*players)
+
+    def add_players(self, *players):
+        for player in players:
+            self.player_names += '['+player.name+']'
+            self.members.append(player.person)
+
+    @classmethod
+    def make_player_names(self, players):
+        return ''.join(sorted('['+player.name+']' for player in players))
+
+class Game(Base):
+    __tablename__ = 'games'
+    id = Column(Integer, Sequence('game_id_seq'), primary_key=True)
+
+    map = Column(String(255))
+    file_name = Column(String(255))
+    datetime = Column(DateTime)
+    category = Column(String(50))
+    type = Column(String(20))
+    matchup = Column(String(100))
+
+    teams = relationship('Team')
+    players = relationship('Player')
+
+    def __init__(self, replay, db):
+        self.map = replay.map
+        self.file_name = replay.filename
+        self.type = replay.type
+        self.datetime = replay.date
+        self.category = replay.category
+        self.teams = [Team(team,db) for team in replay.teams]
+        self.matchup = 'v'.join(sorted(team.lineup for team in self.teams))
+        self.players = sum((team.players for team in self.teams), [])
+
+class Team(Base):
+    __tablename__ = 'teams'
+    id = Column(Integer, Sequence('team_id_seq'), primary_key=True)
+    game_id = Column(Integer, ForeignKey('games.id'))
+    party_id = Column(Integer, ForeignKey('parties.id'))
+
+    result = Column(String(50))
+    number = Column(Integer)
+    lineup = Column(String(10))
+
+    players = relationship('Player')
+    party = relationship('Party')
+    game = relationship('Game')
+
+    def __init__(self, team, db):
+        self.number = team.number
+        self.result = team.result
+        self.players = [Player(player,db) for player in team.players]
+        self.lineup = ''.join(sorted(player.actual_race[0].upper() for player in self.players))
+
+        try:
+            player_names = Party.make_player_names(self.players)
+            self.party = db.query(Party).filter(Party.player_names == player_names).one()
+        except NoResultFound as e:
+            self.party = Party(*self.players)
+
+class Player(Base):
+    __tablename__ = 'players'
+    id = Column(Integer, Sequence('player_id_seq'), primary_key=True)
+    game_id = Column(Integer, ForeignKey('games.id'))
+    team_id = Column(Integer, ForeignKey('teams.id'))
+    person_id = Column(Integer, ForeignKey('people.id'))
+
+    actual_race = Column(String(20))
+    chosen_race = Column(String(20))
+    color_str = Column(String(20))
+    color_hex = Column(String(20))
+
+    name = association_proxy('person','name')
+    person = relationship('Person')
+    team = relationship('Team')
+    game = relationship('Game')
+
+    def __init__(self, player, db):
+        try:
+            self.person = db.query(Person).filter(Person.name == player.name).one()
+        except NoResultFound as e:
+            self.person = Person()
+            self.person.name = player.name
+
+        self.actual_race = player.actual_race
+        self.chosen_race = player.chosen_race
+        self.color_str = str(player.color)
+        self.color_hex = player.color.hex
+
+
+def main(args):
+    db = load_session(args)
+
+    '''
+    personA = Person()
+    personA.name = 'ShadesofGraylin'
+    personB = Person()
+    personB.name = 'Remedy'
+    personC = Person()
+    personC.name = 'Trisfall'
+    personD = Person()
+    personD.name = 'ProfProbe'
+
+    party1 = Party()
+    party1.members.append(personA)
+    party1.members.append(personB)
+
+    party2 = Party()
+    party2.members.append(personC)
+    party2.members.append(personD)
+
+    team1 = Team()
+    team.number = 1
+    team.result = 'Win'
+    team.party = party1
+    team.players
+    team2 = Team()
+    team.number = 2
+    team.result = 'Loss'
+    team.party = part2
+
+
+    db.add(party)
+    db.commit()
+
+    '''
+    for path in args.paths:
+        for file_name in sc2reader.utils.get_files(path, depth=0):
+            print "CREATING: {0}".format(file_name)
+            db.add(Game(sc2reader.read_file(file_name), db))
+
+    db.commit()
+
+    for row in db.query(distinct(Person.name)).all():
+        print row
+
+
+def load_session(args):
+    engine = create_engine(args.storage, echo=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    return Session()
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Stores replay meta data into an SQL database')
+    parser.add_argument('--storage', default='sqlite:///:memory:', type=str, help='Path to the sql storage file of choice')
+    parser.add_argument('paths', metavar='REPLAY', type=str, nargs='+', help='Atleast one replay file to parse and store')
+    args = parser.parse_args()
+
+    main(args)
